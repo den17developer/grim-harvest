@@ -9,34 +9,27 @@ Players.CharacterAutoLoads = false
 local Remotes = ReplicatedStorage:FindFirstChild("Remotes") or Instance.new("Folder", ReplicatedStorage)
 Remotes.Name = "Remotes"
 
---Ресет для теста
-local RequestFullReset = Remotes:FindFirstChild("RequestFullReset") or Instance.new("RemoteEvent", Remotes)
-RequestFullReset.Name = "RequestFullReset"
+-- Функция для гарантированного создания Remote
+local function ensureRemote(name: string, className: string): Instance
+	local remote = Remotes:FindFirstChild(name)
+	if not remote then
+		remote = Instance.new(className)
+		remote.Name = name
+		remote.Parent = Remotes
+	end
+	return remote
+end
 
-
-local RequestPlant = Remotes:FindFirstChild("RequestPlant") or Instance.new("RemoteEvent", Remotes)
-RequestPlant.Name = "RequestPlant"
-
-local CurrencyChanged = Remotes:FindFirstChild("CurrencyChanged") or Instance.new("RemoteEvent", Remotes)
-CurrencyChanged.Name = "CurrencyChanged"
-
-local TierChanged = Remotes:FindFirstChild("TierChanged") or Instance.new("RemoteEvent", Remotes)
-TierChanged.Name = "TierChanged"
-
-local RequestBuySeed = Remotes:FindFirstChild("RequestBuySeed") or Instance.new("RemoteEvent", Remotes)
-RequestBuySeed.Name = "RequestBuySeed"
-
-local InventoryChanged = Remotes:FindFirstChild("InventoryChanged") or Instance.new("RemoteEvent", Remotes)
-InventoryChanged.Name = "InventoryChanged"
-
-local OpenSeedShop = Remotes:FindFirstChild("OpenSeedShop") or Instance.new("RemoteEvent", Remotes)
-OpenSeedShop.Name = "OpenSeedShop"
-
-local SeedToolEquipped = Remotes:FindFirstChild("SeedToolEquipped") or Instance.new("RemoteEvent", Remotes)
-SeedToolEquipped.Name = "SeedToolEquipped"
-
-local SeedToolUnequipped = Remotes:FindFirstChild("SeedToolUnequipped") or Instance.new("RemoteEvent", Remotes)
-SeedToolUnequipped.Name = "SeedToolUnequipped"
+-- Создаём все необходимые Remotes
+local RequestFullReset = ensureRemote("RequestFullReset", "RemoteEvent")
+local RequestPlant = ensureRemote("RequestPlant", "RemoteEvent")
+local CurrencyChanged = ensureRemote("CurrencyChanged", "RemoteEvent")
+local TierChanged = ensureRemote("TierChanged", "RemoteEvent")
+local RequestBuySeed = ensureRemote("RequestBuySeed", "RemoteEvent")
+local InventoryChanged = ensureRemote("InventoryChanged", "RemoteEvent")
+local OpenSeedShop = ensureRemote("OpenSeedShop", "RemoteEvent")
+local SeedToolEquipped = ensureRemote("SeedToolEquipped", "RemoteEvent")
+local SeedToolUnequipped = ensureRemote("SeedToolUnequipped", "RemoteEvent")
 
 -- Modules
 local Persistence = require(script.Parent.Persistence)
@@ -52,6 +45,9 @@ local Anchors = workspace:WaitForChild("PlotAnchors")
 
 local PlayerToPlot : {[Player]: Model} = {}
 local AnchorToPlayer : {[BasePart]: Player} = {}
+
+-- Защита от спама
+local resetCooldown = {}
 
 -- Настройки цен
 local BED_PRICES = { [2]=100, [3]=250, [4]=500 }
@@ -152,7 +148,6 @@ local function purgeSeedTools(player: Player)
 	if bp then purge(bp) end
 	if player.Character then purge(player.Character) end
 end
-
 
 -- Найти первый BasePart в BedModel (куда вешать промпт покупки)
 local function findBedAnchorPart(bed: Instance): BasePart?
@@ -257,7 +252,6 @@ local function createPlantPromptsFor(player: Player, plantId: string)
 	local plot = getPlot(player)
 	if not plot then return end
 
-	-- ВАЖНО: используем FindFirstChild (а не FindChild)
 	local grid = plot:FindFirstChild("GridSlots")
 	if not grid then return end
 
@@ -285,7 +279,7 @@ local function createPlantPromptsFor(player: Player, plantId: string)
 							p.ObjectText = "Лунка"
 							p.ActionText = ("Посадить %s"):format(DISPLAY[plantId] or plantId)
 							p.HoldDuration = 2.0
-							p.MaxActivationDistance = 8 -- увидишь только когда подойдёшь к грядке
+							p.MaxActivationDistance = 8
 							p.RequiresLineOfSight = false
 							p.Parent = s
 
@@ -330,6 +324,12 @@ end
 -- == РАЗВЁРТЫВАНИЕ УЧАСТКА ==
 
 local function deployPlot(player: Player, saveData: table)
+	-- Защита от дублирования
+	if PlayerToPlot[player] then
+		warn("Plot already exists for", player.Name)
+		return
+	end
+
 	local anchor = getFreeAnchor()
 	if not anchor then
 		warn("Нет свободных якорей для", player.Name)
@@ -353,7 +353,7 @@ local function deployPlot(player: Player, saveData: table)
 
 	PlantRuntime.ApplySave(plot, saveData)
 	PlayerToPlot[player] = plot	
-	
+
 	local phase = workspace:GetAttribute("GG_Phase")
 	if phase == "night" then
 		plot:SetAttribute("NightActive", true)
@@ -390,6 +390,8 @@ end
 RequestBuySeed.OnServerEvent:Connect(function(player: Player, plantId: string, amount: number?)
 	local plot = getPlot(player); if not plot then return end
 	if typeof(plantId) ~= "string" then return end
+	if not PlantCatalog[plantId] then return end -- Добавлена проверка
+
 	amount = (typeof(amount) == "number" and amount or 1)
 	amount = math.clamp(amount, 1, 99)
 
@@ -414,6 +416,7 @@ end)
 -- Экипировка семени → создаём промпты посадки на свободных слотах
 SeedToolEquipped.OnServerEvent:Connect(function(player: Player, plantId: string)
 	if typeof(plantId) ~= "string" then return end
+	if not PlantCatalog[plantId] then return end -- Добавлена проверка
 	createPlantPromptsFor(player, plantId)
 end)
 
@@ -421,8 +424,15 @@ SeedToolUnequipped.OnServerEvent:Connect(function(player: Player)
 	clearPlantPrompts(player)
 end)
 
---Запрос ресета
+-- Запрос ресета с защитой от спама
 RequestFullReset.OnServerEvent:Connect(function(player: Player)
+	-- Антиспам защита
+	local now = tick()
+	if resetCooldown[player] and now - resetCooldown[player] < 5 then
+		return -- cooldown 5 секунд
+	end
+	resetCooldown[player] = now
+
 	-- 1) сформировать дефолтный сейв (уже со 1000 Leaves по Schemas)
 	local fresh = Persistence.Default()
 
@@ -430,20 +440,19 @@ RequestFullReset.OnServerEvent:Connect(function(player: Player)
 	Persistence.Save(player, fresh)
 
 	-- 3) Удалить подсказки посадки, участок и освободить якорь, очистить сервисы
-	clearPlantPrompts(player)          -- функция есть выше в этом же файле
-	cleanup(player)                    -- наш же cleanup: удалит plot и освободит якорь
-	purgeSeedTools(player)             -- убрать Tool’ы из Backpack/Character
+	clearPlantPrompts(player)
+	cleanup(player)
+	purgeSeedTools(player)
 
 	-- 4) Инициализировать валюту/инвентарь из «чистого» сейва
 	CurrencyService.Init(player, fresh.Currency)
 	InventoryService.Init(player, fresh.Inventory)
-	refreshAllSeedTools(player)        -- пересоздаст Tool’ы по инвентарю (сейчас их ноль)
+	refreshAllSeedTools(player)
 
 	-- 5) Развернуть участок заново и заспавнить персонажа
-	deployPlot(player, fresh)          -- наш же метод
+	deployPlot(player, fresh)
 	player:LoadCharacter()
 end)
-
 
 -- Жизненный цикл игрока
 Players.PlayerAdded:Connect(function(player)
@@ -456,7 +465,7 @@ Players.PlayerAdded:Connect(function(player)
 
 	-- Создаём Tool'ы согласно инвентарю
 	refreshAllSeedTools(player)
-	
+
 	-- Дублируем синхронизацию после появления персонажа — чтобы Tools точно оказались в Backpack
 	player.CharacterAdded:Connect(function()
 		task.delay(0.2, function()
@@ -484,6 +493,7 @@ Players.PlayerRemoving:Connect(function(player)
 		Persistence.Save(player, save)
 	end
 	cleanup(player)
+	resetCooldown[player] = nil -- Очистка cooldown
 end)
 
 game:BindToClose(function()

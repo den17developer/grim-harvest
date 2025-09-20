@@ -254,7 +254,7 @@ local function onZombieDied(z: Model, plot: Model, zType: string)
 				PlantRuntime.ReturnPlantToSlot(plot, st.targetSlotId, st.carryPlant)
 			end
 		elseif st.targetSlotId then
-			PlantRuntime.ReleaseReservedPlant(plot, st.targetSlotId)
+			PlantRuntime.ReleaseReservedPlant(plot, st.targetSlotId)	
 		end
 	end
 	if not z:GetAttribute("NoReward") then
@@ -439,9 +439,9 @@ function M.Start()
 	end)
 
 	task.spawn(function()
-		local lastPhase = workspace:GetAttribute("GG_Phase") or "day"
+		local lastPhase = workspace:GetAttribute("GG_Phase") or "day"  -- исправлено
 		while true do
-			local phase = workspace:GetAttribute("GG_Phase") or "day"
+			local phase = workspace:GetAttribute("GG_Phase") or "day"  -- исправлено
 
 			if phase ~= lastPhase then
 				if phase == "day" then

@@ -28,9 +28,8 @@ local function applyBedPaletteToModel(bed: Model)
 				part.CollisionGroup = "PlotDecor"
 			elseif name == "border" or string.find(name, "border") then
 				part.Color = BORDER_COLOR
-				-- игроки пусть сталкиваются; зомби не будут — за счёт Collision Groups
 				part.CanCollide = true
-				PhysicsService:SetPartCollisionGroup(part, "PlotDecor")
+				part.CollisionGroup = "PlotDecor"
 			end
 		end
 	end
