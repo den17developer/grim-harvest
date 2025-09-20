@@ -1,0 +1,514 @@
+-- ZombieDirector.lua
+-- Ночь: спавн, устойчивый pathfollow к растениям, кража, перенос к могиле.
+-- Без deprecated-API коллизий, с проверкой наличия растений перед спавном.
+
+local Players = game:GetService("Players")
+local PhysicsService = game:GetService("PhysicsService")
+local PathfindingService = game:GetService("PathfindingService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GardenPlots = workspace:WaitForChild("GardenPlots")
+
+local CurrencyService = require(game.ServerScriptService.CurrencyService)
+local Persistence = require(game.ServerScriptService.Persistence)
+local PlantRuntime = require(game.ServerScriptService.PlantRuntime)
+local ZombieCatalog = require(game.ReplicatedStorage.Shared.ZombieCatalog)
+
+local M = {}
+
+-- Папка для зомби
+local zombiesFolder = workspace:FindFirstChild("Zombies")
+if not zombiesFolder then
+	zombiesFolder = Instance.new("Folder")
+	zombiesFolder.Name = "Zombies"
+	zombiesFolder.Parent = workspace
+end
+
+-- Состояния
+type NightState = { NextSpawnTime: number, Spawned: number, MaxAlive: number, _lastLogT: number? }
+local plotState: {[Model]: NightState} = {}
+local zombieToPlot: {[Model]: Model} = {}
+
+type ZState = {
+	plot: Model,
+	mode: "seek" | "carry",
+	targetSlotId: string?,
+	targetPlant: BasePart?,     -- кого преследуем
+	carryPlant: BasePart?,      -- кого несём
+	gravePos: Vector3?,
+	moveToken: number?,         -- для отмены старого движения
+	currentGoal: Vector3?,      -- последняя цель движения
+}
+local zState: {[Model]: ZState} = {}
+
+-- === Утилиты ===
+local function getOwnerPlayer(plot: Model): Player?
+	local uid = plot:GetAttribute("OwnerUserId"); if not uid then return nil end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.UserId == uid then return p end
+	end
+	return nil
+end
+
+local function getUnlockedTier(plot: Model): number
+	local grid = plot:FindFirstChild("GridSlots")
+	local maxT = 1
+	if grid then
+		for _, bed in ipairs(grid:GetChildren()) do
+			if bed:IsA("Model") and bed:GetAttribute("Unlocked") == true then
+				maxT = math.max(maxT, bed:GetAttribute("UnlockTier") or 1)
+			end
+		end
+	end
+	return maxT
+end
+
+local function getAnyGraveCFrame(plot: Model): CFrame?
+	local graves = plot:FindFirstChild("GraveSpawns")
+	if graves then
+		local parts = {}
+		for _, ch in ipairs(graves:GetChildren()) do
+			if ch:IsA("BasePart") then table.insert(parts, ch) end
+		end
+		if #parts > 0 then
+			return parts[math.random(1, #parts)].CFrame
+		end
+	end
+	local root = plot.PrimaryPart or plot:FindFirstChild("Root")
+	return root and (root.CFrame + Vector3.new(0, 0, 18)) or nil
+end
+
+local function getPlotCenter(plot: Model): Vector3
+	local root = plot.PrimaryPart or plot:FindFirstChild("Root")
+	if root and root:IsA("BasePart") then return root.Position end
+	return plot:GetPivot().Position
+end
+
+local function rewardOnDeath(plot: Model, zType: string)
+	local cfg = ZombieCatalog[zType] or ZombieCatalog.grunt
+	local plr = getOwnerPlayer(plot); if not plr then return end
+	if (cfg.RewardLeaves or 0) > 0 then
+		CurrencyService.AddLeaves(plr, cfg.RewardLeaves)
+	end
+end
+
+-- Ближайшее "доступное" растение (по всему участку)
+local function findClosestStealablePlant(plot: Model, fromPos: Vector3): (BasePart?, string?)
+	local best, bestD, bestSlot
+	for _, obj in ipairs(plot:GetDescendants()) do
+		if obj:IsA("BasePart") and obj.Name:match("^Plant_") then
+			if obj:GetAttribute("IsCarried") ~= true and obj:GetAttribute("BeingStolen") ~= true then
+				local slotId = obj:GetAttribute("SlotId")
+				if slotId then
+					local d = (obj.Position - fromPos).Magnitude
+					if (not best) or d < bestD then
+						best = obj; bestD = d; bestSlot = slotId
+					end
+				end
+			end
+		end
+	end
+	return best, bestSlot
+end
+
+-- Кол-во доступных к похищению растений
+local function countStealablePlants(plot: Model): number
+	local n = 0
+	for _, obj in ipairs(plot:GetDescendants()) do
+		if obj:IsA("BasePart") and obj.Name:match("^Plant_") then
+			if obj:GetAttribute("IsCarried") ~= true and obj:GetAttribute("BeingStolen") ~= true then
+				n += 1
+			end
+		end
+	end
+	return n
+end
+
+-- === Pathfollow (корутина + MoveToFinished) ===
+local PATH_PARAMS = {
+	AgentRadius = 1.4,
+	AgentHeight = 5,
+	AgentCanJump = true,
+	AgentCanClimb = true,
+	AgentMaxSlope = 40,
+	WaypointSpacing = 3,
+}
+
+local function followTo(z: Model, dest: Vector3, tol: number)
+	local st = zState[z]; if not st then return end
+	st.moveToken = (st.moveToken or 0) + 1
+	local token = st.moveToken
+	local hum: Humanoid? = z:FindFirstChildOfClass("Humanoid"); if not hum then return end
+
+	task.spawn(function()
+		local function valid() return z.Parent ~= nil and zState[z] and zState[z].moveToken == token end
+		while valid() do
+			local hrp = z.PrimaryPart; if not hrp then return end
+			if (dest - hrp.Position).Magnitude <= tol then return end
+
+			local path = PathfindingService:CreatePath(PATH_PARAMS)
+			local ok = pcall(function() path:ComputeAsync(hrp.Position, dest) end)
+			if not ok or path.Status ~= Enum.PathStatus.Success then
+				hum:MoveTo(dest)
+				local done = false
+				local c; c = hum.MoveToFinished:Connect(function() done = true end)
+				local t0 = time()
+				while valid() and not done and time() - t0 < 3.0 do task.wait(0.05) end
+				if c then c:Disconnect() end
+			else
+				local wps = path:GetWaypoints()
+				for _, wp in ipairs(wps) do
+					if not valid() then return end
+					hum:MoveTo(wp.Position)
+					if wp.Action == Enum.PathWaypointAction.Jump then
+						hum.Jump = true
+					end
+					local done = false
+					local c; c = hum.MoveToFinished:Connect(function() done = true end)
+					local t0 = time()
+					while valid() and not done and time() - t0 < 2.5 do task.wait(0.05) end
+					if c then c:Disconnect() end
+				end
+			end
+			task.wait(0.05)
+		end
+	end)
+end
+
+local function ensureFollowing(z: Model, goal: Vector3, tol: number)
+	local st = zState[z]; if not st then return end
+	tol = tol or 3
+	if not st.currentGoal or (st.currentGoal - goal).Magnitude > tol then
+		st.currentGoal = goal
+		followTo(z, goal, tol)
+	end
+end
+
+-- === Создание/смерть зомби ===
+local function createZombieModel(zType: string): Model
+	local cfg = ZombieCatalog[zType] or ZombieCatalog.grunt
+
+	local model = Instance.new("Model")
+	model.Name = "Zombie_"..zType
+
+	local hrp = Instance.new("Part")
+	hrp.Name = "HumanoidRootPart"
+	hrp.Size = Vector3.new(2, 2, 1)
+	hrp.Anchored = false
+	hrp.CanCollide = false
+	hrp.TopSurface = Enum.SurfaceType.Smooth
+	hrp.BottomSurface = Enum.SurfaceType.Smooth
+	hrp.Color = Color3.fromRGB(90, 140, 90)
+	hrp.Parent = model
+
+	local torso = Instance.new("Part")
+	torso.Name = "Torso"
+	torso.Size = Vector3.new(2, 2, 1)
+	torso.Anchored = false
+	torso.CanCollide = true
+	torso.TopSurface = Enum.SurfaceType.Smooth
+	torso.BottomSurface = Enum.SurfaceType.Smooth
+	torso.Color = Color3.fromRGB(95, 150, 95)
+	torso.CFrame = hrp.CFrame * CFrame.new(0, -1, 0)
+	torso.Parent = model
+
+	local weldRT = Instance.new("WeldConstraint")
+	weldRT.Part0 = hrp
+	weldRT.Part1 = torso
+	weldRT.Parent = hrp
+
+	local head = Instance.new("Part")
+	head.Name = "Head"
+	head.Size = Vector3.new(2, 1, 2)
+	head.Anchored = false
+	head.CanCollide = true
+	head.Color = Color3.fromRGB(120, 180, 120)
+	head.CFrame = hrp.CFrame * CFrame.new(0, 1.6, 0)
+	head.Parent = model
+
+	local weldRH = Instance.new("WeldConstraint")
+	weldRH.Part0 = hrp
+	weldRH.Part1 = head
+	weldRH.Parent = hrp
+
+	local hum = Instance.new("Humanoid")
+	hum.Name = "Humanoid"
+	hum.WalkSpeed = cfg.WalkSpeed
+	hum.MaxHealth = cfg.MaxHP
+	hum.Health = cfg.MaxHP
+	hum.AutoRotate = true
+	hum.HipHeight = 0.5
+	hum.UseJumpPower = true
+	hum.JumpPower = 50
+	pcall(function() hum.StepHeight = 3 end)
+	hum.Parent = model
+
+	model.PrimaryPart = hrp
+	return model
+end
+
+local function onZombieDied(z: Model, plot: Model, zType: string)
+	local st = zState[z]
+	if st then
+		if st.carryPlant and st.targetSlotId then
+			if st.carryPlant.Parent then
+				PlantRuntime.ReturnPlantToSlot(plot, st.targetSlotId, st.carryPlant)
+			end
+		elseif st.targetSlotId then
+			PlantRuntime.ReleaseReservedPlant(plot, st.targetSlotId)
+		end
+	end
+	if not z:GetAttribute("NoReward") then
+		rewardOnDeath(plot, zType)
+	end
+	zombieToPlot[z] = nil
+	zState[z] = nil
+	if z and z.Parent then z:Destroy() end
+end
+
+local function spawnOne(plot: Model, zType: string)
+	-- если нет доступных растений — отменяем спавн
+	if countStealablePlants(plot) == 0 then return end
+
+	local spawnCf = getAnyGraveCFrame(plot); if not spawnCf then return end
+	local z = createZombieModel(zType)
+	z:SetAttribute("ZombieType", zType)
+	z.Parent = zombiesFolder
+	z:PivotTo(spawnCf + Vector3.new(0, 3, 0))
+
+	for _, bp in ipairs(z:GetDescendants()) do
+		if bp:IsA("BasePart") then
+			bp.Massless = true
+			bp:SetNetworkOwner(nil)
+			bp.CollisionGroup = "Zombies"
+		end
+	end
+
+	zombieToPlot[z] = plot
+	zState[z] = { plot = plot, mode = "seek" }
+
+	local hum: Humanoid? = z:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.Died:Connect(function() onZombieDied(z, plot, zType) end)
+		hum:ChangeState(Enum.HumanoidStateType.Running)
+		hum.Sit = false
+		hum.PlatformStand = false
+	end
+
+	-- поведение
+	task.spawn(function()
+		while z.Parent ~= nil do
+			local st = zState[z]; if not st then break end
+			local hrp = z.PrimaryPart; if not hrp then break end
+
+			-- если по ходу ночи растения закончились, а цели нет — снять "лишних"
+			if countStealablePlants(plot) == 0 and st.mode ~= "carry" then
+				-- НО не трогаем зомби, у которого уже есть зарезервированная цель
+				if not st.targetSlotId then
+					z:SetAttribute("NoReward", true)
+					z:Destroy()
+					break
+				end
+			end
+
+			if st.mode == "seek" then
+				if st.targetPlant and st.targetPlant.Parent and st.targetSlotId then
+					if (st.targetPlant.Position - hrp.Position).Magnitude <= 3.2 then
+						task.wait(0.2)
+						if PlantRuntime.BeginCarry(plot, st.targetSlotId, st.targetPlant, z) then
+							st.mode = "carry"
+							st.carryPlant = st.targetPlant
+							local graveCf = getAnyGraveCFrame(plot) or CFrame.new(getPlotCenter(plot))
+							st.gravePos = graveCf.Position
+							st.targetPlant = nil
+							st.currentGoal = nil
+							ensureFollowing(z, st.gravePos, 4)
+						else
+							PlantRuntime.ReleaseReservedPlant(plot, st.targetSlotId)
+							st.targetPlant = nil
+							st.targetSlotId = nil
+							st.currentGoal = nil
+						end
+					else
+						ensureFollowing(z, st.targetPlant.Position, 3)
+					end
+				else
+					local plant, slotId = findClosestStealablePlant(plot, hrp.Position)
+					if plant and slotId then
+						local reserved = PlantRuntime.ReservePlantForTheft(plot, slotId)
+						if reserved == plant then
+							st.targetPlant = plant
+							st.targetSlotId = slotId
+							st.currentGoal = nil
+							ensureFollowing(z, plant.Position, 3)
+						else
+							st.targetPlant = nil
+							st.targetSlotId = nil
+						end
+					else
+						ensureFollowing(z, getPlotCenter(plot), 2.5)
+					end
+				end
+
+			elseif st.mode == "carry" then
+				if st.gravePos and st.carryPlant and st.targetSlotId then
+					if (st.gravePos - hrp.Position).Magnitude <= 4 then
+						PlantRuntime.RemovePlantBySlot(plot, st.targetSlotId)
+						local plr = getOwnerPlayer(plot)
+						if plr then
+							local partial = PlantRuntime.CollectState(plot)
+							local save = Persistence.Load(plr) or Persistence.Default()
+							save.UnlockedTier = partial.UnlockedTier or save.UnlockedTier
+							save.Plants      = partial.Plants      or save.Plants
+							save.DayCount    = partial.DayCount    or save.DayCount
+							save.Currency    = save.Currency or { Leaves = 0, Spores = 0 }
+							-- РЕКОМЕНДАЦИЯ: лучше MarkDirty и Flush утром
+							Persistence.Save(plr, save)
+						end
+						st.mode = "seek"
+						st.carryPlant = nil
+						st.targetSlotId = nil
+						st.gravePos = nil
+						st.currentGoal = nil
+					else
+						ensureFollowing(z, st.gravePos, 4)
+					end
+				else
+					st.mode = "seek"
+					st.carryPlant = nil
+					st.targetSlotId = nil
+					st.gravePos = nil
+					st.currentGoal = nil
+				end
+			end
+
+			task.wait(0.25)
+		end
+	end)
+end
+
+-- === Ночь/утро, чистка ===
+local function ensureNightState(plot: Model): NightState
+	local st = plotState[plot]
+	if not st then
+		local tier = getUnlockedTier(plot)
+		local maxAlive = math.clamp(2 + tier, 3, 12)
+		st = { NextSpawnTime = time(), Spawned = 0, MaxAlive = maxAlive, _lastLogT = nil }
+		plotState[plot] = st
+	end
+	return st
+end
+
+local function countAliveOnPlot(plot: Model): number
+	local n = 0
+	for z, pl in pairs(zombieToPlot) do
+		if pl == plot and z.Parent ~= nil then n += 1 end
+	end
+	return n
+end
+
+local function cleanupAllZombiesOnPlot(plot: Model)
+	for z, pl in pairs(zombieToPlot) do
+		if pl == plot then
+			local st = zState[z]
+			if st then
+				if st.carryPlant and st.targetSlotId then
+					if st.carryPlant.Parent then
+						PlantRuntime.ReturnPlantToSlot(plot, st.targetSlotId, st.carryPlant)
+					end
+				elseif st.targetSlotId then
+					PlantRuntime.ReleaseReservedPlant(plot, st.targetSlotId)
+				end
+			end
+			if z and z.Parent then
+				z:SetAttribute("NoReward", true)
+				z:Destroy()
+			end
+			zombieToPlot[z] = nil
+			zState[z] = nil
+		end
+	end
+	plotState[plot] = nil
+	PlantRuntime.ClearTheftFlags(plot)
+end
+
+function M.Start()
+	GardenPlots.ChildRemoved:Connect(function(child)
+		if child:IsA("Model") then
+			cleanupAllZombiesOnPlot(child)
+		end
+	end)
+
+	task.spawn(function()
+		local lastPhase = workspace:GetAttribute("GG_Phase") or "day"
+		while true do
+			local phase = workspace:GetAttribute("GG_Phase") or "day"
+
+			if phase ~= lastPhase then
+				if phase == "day" then
+					for _, plot in ipairs(GardenPlots:GetChildren()) do
+						if plot:IsA("Model") then
+							cleanupAllZombiesOnPlot(plot)
+							PlantRuntime.ClearTheftFlags(plot)
+						end
+					end
+				end
+				lastPhase = phase
+			end
+
+			if phase == "night" then
+				for _, plot in ipairs(GardenPlots:GetChildren()) do
+					if not plot:IsA("Model") then continue end
+					if plot:GetAttribute("NightActive") ~= true then continue end
+
+					local st = ensureNightState(plot)
+					local now = time()
+
+					local tier = getUnlockedTier(plot)
+					local spawnInterval = math.clamp(4 - tier*0.25, 1.5, 4)
+					local alive = countAliveOnPlot(plot)
+					local avail = countStealablePlants(plot)
+
+					if (st._lastLogT or 0) + 2 < now then
+						print(("[DIR] plot=%s, night, alive=%d, availPlants=%d"):format(plot.Name, alive, avail))
+						st._lastLogT = now
+					end
+
+					-- Нет доступных растений: удерживаем только тех, у кого есть цель/носилка
+					if avail == 0 then
+						if alive > 0 then
+							for z, pl in pairs(zombieToPlot) do
+								if pl == plot and z.Parent then
+									local zs = zState[z]
+									if not (zs and (zs.carryPlant or zs.targetSlotId)) then
+										z:SetAttribute("NoReward", true)
+										z:Destroy()
+									end
+								end
+							end
+						end
+						st.NextSpawnTime = now + 1.5
+						continue
+					end
+
+					if alive < st.MaxAlive and now >= st.NextSpawnTime then
+						local r = math.random()
+						local zType = (r < 0.65) and "grunt" or ((r < 0.9) and "brute" or "skipper")
+						spawnOne(plot, zType)
+						st.Spawned += 1
+						st.NextSpawnTime = now + spawnInterval
+					end
+				end
+			end
+
+			task.wait(0.2)
+		end
+	end)
+end
+
+function M.Stop()
+	for _, plot in ipairs(GardenPlots:GetChildren()) do
+		if plot:IsA("Model") then cleanupAllZombiesOnPlot(plot) end
+	end
+end
+
+return M

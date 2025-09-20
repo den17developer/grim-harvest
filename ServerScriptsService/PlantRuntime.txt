@@ -1,0 +1,367 @@
+-- PlantRuntime.lua
+local ServerStorage = game:GetService("ServerStorage")
+local PhysicsService = game:GetService("PhysicsService")
+local PlantCatalog = require(game.ReplicatedStorage.Shared.PlantCatalog)
+
+local M = {}
+
+-- внутренний реестр занятых слотов для каждого plot
+local occupied: {[Model]: {[string]: boolean}} = {}
+
+local function ensure(plot: Model)
+	occupied[plot] = occupied[plot] or {}
+end
+
+-- ===== Фирменные цвета грядок (из твоей палитры) =====
+local BORDER_COLOR = Color3.fromRGB(97, 44, 12)
+local GROUND_COLOR = Color3.fromRGB(161, 89, 39)
+
+local function applyBedPaletteToModel(bed: Model)
+	local mesh = bed:FindFirstChild("BedModel")
+	if not (mesh and mesh:IsA("Folder")) then return end
+	for _, part in ipairs(mesh:GetChildren()) do
+		if part:IsA("BasePart") then
+			local name = string.lower(part.Name)
+			if name == "ground" or string.find(name, "ground") then
+				part.Color = GROUND_COLOR
+				part.CanCollide = true
+				part.CollisionGroup = "PlotDecor"
+			elseif name == "border" or string.find(name, "border") then
+				part.Color = BORDER_COLOR
+				-- игроки пусть сталкиваются; зомби не будут — за счёт Collision Groups
+				part.CanCollide = true
+				PhysicsService:SetPartCollisionGroup(part, "PlotDecor")
+			end
+		end
+	end
+end
+
+-- ===== Кэш оригинального вида деталей (на случай перекраски) =====
+local function storeOriginalVisual(part: BasePart)
+	if part:GetAttribute("OrigColorR") == nil then
+		local c = part.Color
+		part:SetAttribute("OrigColorR", c.R)
+		part:SetAttribute("OrigColorG", c.G)
+		part:SetAttribute("OrigColorB", c.B)
+	end
+	if part:GetAttribute("OrigTransparency") == nil then
+		part:SetAttribute("OrigTransparency", part.Transparency)
+	end
+	if part:GetAttribute("OrigMaterial") == nil then
+		part:SetAttribute("OrigMaterial", part.Material.Name)
+	end
+end
+
+local function getOriginalColor(part: BasePart): Color3?
+	local r = part:GetAttribute("OrigColorR")
+	local g = part:GetAttribute("OrigColorG")
+	local b = part:GetAttribute("OrigColorB")
+	if typeof(r) == "number" and typeof(g) == "number" and typeof(b) == "number" then
+		return Color3.new(r, g, b)
+	end
+	return nil
+end
+
+local function getOriginalTransparency(part: BasePart): number?
+	local t = part:GetAttribute("OrigTransparency")
+	if typeof(t) == "number" then return t end
+	return nil
+end
+
+local function getOriginalMaterial(part: BasePart): Enum.Material?
+	local name = part:GetAttribute("OrigMaterial")
+	if typeof(name) == "string" and Enum.Material[name] then
+		return Enum.Material[name]
+	end
+	return nil
+end
+
+-- восстановление раскраски деталей грядки из шаблона (safety)
+local function restoreFromTemplate(bed: Model)
+	local template = ServerStorage:FindFirstChild("PlotTemplate")
+	if not (template and template:IsA("Model")) then return end
+	local gridTpl = template:FindFirstChild("GridSlots")
+	if not (gridTpl and gridTpl:IsA("Folder")) then return end
+
+	local tplBed = gridTpl:FindFirstChild(bed.Name)
+	if not tplBed or not tplBed:IsA("Model") then
+		local tier = bed:GetAttribute("UnlockTier")
+		for _, b in ipairs(gridTpl:GetChildren()) do
+			if b:IsA("Model") and (b:GetAttribute("UnlockTier") == tier) then
+				tplBed = b; break
+			end
+		end
+	end
+	if not tplBed then return end
+
+	local bedModel = bed:FindFirstChild("BedModel")
+	local tplModel = tplBed:FindFirstChild("BedModel")
+	if not (bedModel and tplModel and bedModel:IsA("Folder") and tplModel:IsA("Folder")) then return end
+
+	local map = {}
+	for _, p in ipairs(tplModel:GetChildren()) do
+		if p:IsA("BasePart") then
+			map[p.Name] = p
+		end
+	end
+	for _, p in ipairs(bedModel:GetChildren()) do
+		if p:IsA("BasePart") then
+			local src = map[p.Name]
+			if src and src:IsA("BasePart") then
+				p.Color = src.Color
+				p.Material = src.Material
+				storeOriginalVisual(p)
+			end
+		end
+	end
+end
+
+-- ===== ВИЗУАЛ ГРЯДОК (unlocked/purchasable/hidden) =====
+local function setBedVisual(bed: Instance, state: string)
+	if not bed or not bed:IsA("Model") then return end
+	bed:SetAttribute("Unlocked", state == "unlocked")
+	bed:SetAttribute("Purchasable", state == "purchasable")
+	bed:SetAttribute("Hidden", state == "hidden")
+
+	local mesh = bed:FindFirstChild("BedModel")
+	if not (mesh and mesh:IsA("Folder")) then return end
+
+	if state == "unlocked" or state == "purchasable" then
+		applyBedPaletteToModel(bed)
+	end
+
+	for _, part in ipairs(mesh:GetChildren()) do
+		if part:IsA("BasePart") then
+			storeOriginalVisual(part)
+			if state == "unlocked" then
+				local oc = getOriginalColor(part); if oc then part.Color = oc end
+				local ot = getOriginalTransparency(part); if ot ~= nil then part.Transparency = ot else part.Transparency = 0 end
+				local om = getOriginalMaterial(part); if om then part.Material = om end
+				part.CanCollide = true; part.CastShadow = true
+			elseif state == "purchasable" then
+				local oc = getOriginalColor(part); if oc then part.Color = oc end
+				local om = getOriginalMaterial(part); if om then part.Material = om end
+				part.Transparency = 0.35
+				part.CanCollide = true; part.CastShadow = false
+			else -- hidden
+				part.Transparency = 1
+				part.CanCollide = false; part.CastShadow = false
+			end
+		end
+	end
+end
+
+-- ===== Слоты =====
+local function getSlotById(plot: Model, slotId: string): BasePart?
+	local grid = plot:FindFirstChild("GridSlots")
+	if not grid then return nil end
+	for _, bed in ipairs(grid:GetChildren()) do
+		if bed:IsA("Model") and (bed:GetAttribute("Unlocked") == true) then
+			local slots = bed:FindFirstChild("Slots")
+			if slots then
+				for _, s in ipairs(slots:GetChildren()) do
+					if s:GetAttribute("SlotId") == slotId then
+						return s :: BasePart
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+function M.GetSlotCFrame(plot: Model, slotId: string): CFrame?
+	local slot = getSlotById(plot, slotId)
+	if not slot then return nil end
+	return slot:IsA("Attachment") and slot.WorldCFrame or slot.CFrame
+end
+
+-- ===== Применение сейва (грядки + растения) =====
+function M.ApplySave(plot: Model, save: table)
+	ensure(plot)
+	local grid = plot:FindFirstChild("GridSlots")
+	local unlockedTier = save.UnlockedTier or 1
+	if grid then
+		for _, bed in ipairs(grid:GetChildren()) do
+			if bed:IsA("Model") then
+				local tier = bed:GetAttribute("UnlockTier") or 1
+				if tier <= unlockedTier then
+					setBedVisual(bed, "unlocked")
+				elseif tier == unlockedTier + 1 then
+					setBedVisual(bed, "purchasable")
+				else
+					setBedVisual(bed, "hidden")
+				end
+			end
+		end
+	end
+
+	occupied[plot] = {}
+	for slotId, plantSave in pairs(save.Plants or {}) do
+		if plantSave then
+			M.SpawnPlantAtSlotId(plot, slotId, plantSave)
+		end
+	end
+end
+
+-- ===== Растения: спавн/удаление/возврат =====
+function M.IsSlotOccupied(plot: Model, slotId: string): boolean
+	ensure(plot)
+	return occupied[plot][slotId] == true
+end
+
+function M.SpawnPlantAtSlotId(plot: Model, slotId: string, plantSave: table)
+	ensure(plot)
+	if occupied[plot][slotId] then return end
+
+	local slotCf = M.GetSlotCFrame(plot, slotId); if not slotCf then return end
+
+	local p = Instance.new("Part")
+	p.Name = "Plant_"..(plantSave.PlantId or "unknown")
+	p.Size = Vector3.new(1.5, 2, 1.5)
+	p.Anchored = true
+	p.CanCollide = false
+	p.CFrame = slotCf + Vector3.new(0, 1, 0)
+
+	local cfg = PlantCatalog[plantSave.PlantId] or { BaseHP = 100 }
+	p:SetAttribute("PlantId", plantSave.PlantId)
+	p:SetAttribute("SlotId", slotId)
+	p:SetAttribute("Level", plantSave.Level or 1)
+	p:SetAttribute("Rarity", plantSave.Rarity or "common")
+	p:SetAttribute("HP", plantSave.HP or cfg.BaseHP)
+	p:SetAttribute("IsCarried", false)
+	p:SetAttribute("BeingStolen", false)
+
+	p.Parent = plot
+	occupied[plot][slotId] = true
+end
+
+function M.RemovePlantBySlot(plot: Model, slotId: string)
+	ensure(plot)
+	for _, obj in ipairs(plot:GetChildren()) do
+		if obj:IsA("BasePart") and obj.Name:find("^Plant_") then
+			if obj:GetAttribute("SlotId") == slotId then
+				local weld = obj:FindFirstChild("CarryWeld")
+				if weld and weld:IsA("WeldConstraint") then weld:Destroy() end
+				obj:Destroy()
+				break
+			end
+		end
+	end
+	occupied[plot][slotId] = nil
+end
+
+-- Резервирование на кражу (чтобы второй зомби не лез)
+function M.ReservePlantForTheft(plot: Model, slotId: string): BasePart?
+	for _, obj in ipairs(plot:GetChildren()) do
+		if obj:IsA("BasePart") and obj.Name:find("^Plant_") then
+			if obj:GetAttribute("SlotId") == slotId then
+				if obj:GetAttribute("IsCarried") == true then return nil end
+				if obj:GetAttribute("BeingStolen") == true then return nil end
+				obj:SetAttribute("BeingStolen", true)
+				return obj
+			end
+		end
+	end
+	return nil
+end
+
+function M.ReleaseReservedPlant(plot: Model, slotId: string)
+	for _, obj in ipairs(plot:GetChildren()) do
+		if obj:IsA("BasePart") and obj.Name:find("^Plant_") then
+			if obj:GetAttribute("SlotId") == slotId then
+				obj:SetAttribute("BeingStolen", false)
+				return
+			end
+		end
+	end
+end
+
+-- Поднять растение (привязать к зомби)
+function M.BeginCarry(plot: Model, slotId: string, plant: BasePart, zombieModel: Model)
+	if not (plant and zombieModel) then return false end
+	if plant:GetAttribute("IsCarried") == true then return false end
+
+	local hrp = zombieModel:FindFirstChild("HumanoidRootPart")
+	if not (hrp and hrp:IsA("BasePart")) then return false end
+
+	plant.Anchored = false
+	plant.CanCollide = false
+	plant.CFrame = hrp.CFrame * CFrame.new(0, 2, -1) -- немного спереди/сверху
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Name = "CarryWeld"
+	weld.Part0 = hrp
+	weld.Part1 = plant
+	weld.Parent = plant
+
+	plant:SetAttribute("IsCarried", true)
+	plant:SetAttribute("BeingStolen", false)
+	return true
+end
+
+-- Вернуть растение в слот (если зомби убит)
+function M.ReturnPlantToSlot(plot: Model, slotId: string, plant: BasePart)
+	local slotCf = M.GetSlotCFrame(plot, slotId); if not slotCf then return end
+	local weld = plant:FindFirstChild("CarryWeld")
+	if weld and weld:IsA("WeldConstraint") then weld:Destroy() end
+	plant.CFrame = slotCf + Vector3.new(0, 1, 0)
+	plant.Anchored = true
+	plant.CanCollide = false
+	plant:SetAttribute("IsCarried", false)
+	plant:SetAttribute("BeingStolen", false)
+	occupied[plot][slotId] = true
+end
+
+-- ===== Сбор состояния =====
+function M.CollectState(plot: Model)
+	occupied[plot] = {}
+	local save = {
+		UnlockedTier = 1,
+		Plants = {},
+		DayCount = plot:GetAttribute("DayCount") or 0
+	}
+	local grid = plot:FindFirstChild("GridSlots")
+	if grid then
+		local maxOpened = 0
+		for _, bed in ipairs(grid:GetChildren()) do
+			if bed:IsA("Model") and (bed:GetAttribute("Unlocked") == true) then
+				maxOpened = math.max(maxOpened, bed:GetAttribute("UnlockTier") or 1)
+			end
+		end
+		save.UnlockedTier = math.max(maxOpened, 1)
+	end
+	for _, obj in ipairs(plot:GetChildren()) do
+		if obj:IsA("BasePart") and obj.Name:find("^Plant_") then
+			local slotId = obj:GetAttribute("SlotId")
+			if slotId then
+				save.Plants[slotId] = {
+					PlantId = obj:GetAttribute("PlantId"),
+					Level = obj:GetAttribute("Level"),
+					Rarity = obj:GetAttribute("Rarity"),
+					HP = obj:GetAttribute("HP"),
+				}
+				occupied[plot][slotId] = true
+			end
+		end
+	end
+	return save
+end
+
+-- ===== Сброс «залипших» флагов кражи и возврат несомых растений =====
+function M.ClearTheftFlags(plot: Model)
+	for _, obj in ipairs(plot:GetChildren()) do
+		if obj:IsA("BasePart") and obj.Name:find("^Plant_") then
+			local slotId = obj:GetAttribute("SlotId")
+			local carried = obj:GetAttribute("IsCarried")
+			-- Если вдруг растение "в руках" у уже удалённого зомби — возвращаем
+			if carried and slotId then
+				M.ReturnPlantToSlot(plot, slotId, obj)
+			end
+			-- В любом случае снимаем "резерв"
+			obj:SetAttribute("BeingStolen", false)
+		end
+	end
+end
+
+return M
