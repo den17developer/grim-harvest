@@ -1,4 +1,7 @@
 -- InventoryService.lua
+-- ModuleScript
+-- Путь: ServerScriptService/InventoryService
+
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Remotes = ReplicatedStorage:FindFirstChild("Remotes") or Instance.new("Folder", ReplicatedStorage)
 Remotes.Name = "Remotes"
@@ -23,6 +26,7 @@ function M.Init(player: Player, saveInventory: table?)
 		pea = seeds.pea or 0,
 		sunflower = seeds.sunflower or 0,
 		wallnut = seeds.wallnut or 0,
+		pear = seeds.pear or 0,
 	}
 	notify(player)
 end
@@ -54,6 +58,7 @@ function M.Export(player: Player)
 			pea = t.pea or 0,
 			sunflower = t.sunflower or 0,
 			wallnut = t.wallnut or 0,
+			pear = t.pear or 0,
 		}
 	}
 end

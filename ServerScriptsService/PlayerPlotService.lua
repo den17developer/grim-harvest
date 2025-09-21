@@ -197,7 +197,7 @@ local function setupBuyPromptForNext(plot: Model, player: Player, unlockedTier: 
 					local prompt = Instance.new("ProximityPrompt")
 					prompt.Name = "BuyPrompt"
 					prompt.ObjectText = ("Грядка #%d"):format(nextTier)
-					prompt.ActionText = ("Купить за %d").format and ("Купить за %d"):format(price) or ("Buy "..price)
+					prompt.ActionText = ("Купить за %d"):format(price) 
 					prompt.HoldDuration = 1.2
 					prompt.MaxActivationDistance = 10
 					prompt.RequiresLineOfSight = false
@@ -221,6 +221,7 @@ local function setupBuyPromptForNext(plot: Model, player: Player, unlockedTier: 
 						save.Currency = CurrencyService.Export(player)
 						save.Inventory = InventoryService.Export(player)
 						Persistence.Save(player, save)
+						Persistence.FlushNow(player) -- ВАЖНО: сразу сохраняем
 
 						PlantRuntime.ApplySave(plot, save)
 						TierChanged:FireClient(player, nextTier)
@@ -297,7 +298,7 @@ local function createPlantPromptsFor(player: Player, plantId: string)
 									PlantId = plantId, Level = 1, Rarity = "common"
 								})
 
-								-- обновим сейв и инструменты
+								-- ВАЖНО: обновим сейв и сохраним
 								local partial = PlantRuntime.CollectState(plot)
 								local save = Persistence.Load(player) or Persistence.Default()
 								save.UnlockedTier = partial.UnlockedTier or save.UnlockedTier
@@ -306,6 +307,7 @@ local function createPlantPromptsFor(player: Player, plantId: string)
 								save.Currency = CurrencyService.Export(player)
 								save.Inventory = InventoryService.Export(player)
 								Persistence.Save(player, save)
+								Persistence.FlushNow(player) -- ВАЖНО: сразу сохраняем
 
 								refreshAllSeedTools(player)
 
@@ -390,7 +392,7 @@ end
 RequestBuySeed.OnServerEvent:Connect(function(player: Player, plantId: string, amount: number?)
 	local plot = getPlot(player); if not plot then return end
 	if typeof(plantId) ~= "string" then return end
-	if not PlantCatalog[plantId] then return end -- Добавлена проверка
+	if not PlantCatalog[plantId] then return end
 
 	amount = (typeof(amount) == "number" and amount or 1)
 	amount = math.clamp(amount, 1, 99)
@@ -406,17 +408,18 @@ RequestBuySeed.OnServerEvent:Connect(function(player: Player, plantId: string, a
 	local cnt = seeds[plantId] or 0
 	ensureSeedToolFor(player, plantId, cnt)
 
-	-- сейв
+	-- ВАЖНО: сохраняем покупку сразу
 	local save = Persistence.Load(player) or Persistence.Default()
 	save.Currency = CurrencyService.Export(player)
 	save.Inventory = InventoryService.Export(player)
 	Persistence.Save(player, save)
+	Persistence.FlushNow(player) -- ВАЖНО: сразу сохраняем
 end)
 
 -- Экипировка семени → создаём промпты посадки на свободных слотах
 SeedToolEquipped.OnServerEvent:Connect(function(player: Player, plantId: string)
 	if typeof(plantId) ~= "string" then return end
-	if not PlantCatalog[plantId] then return end -- Добавлена проверка
+	if not PlantCatalog[plantId] then return end
 	createPlantPromptsFor(player, plantId)
 end)
 
@@ -436,8 +439,9 @@ RequestFullReset.OnServerEvent:Connect(function(player: Player)
 	-- 1) сформировать дефолтный сейв (уже со 1000 Leaves по Schemas)
 	local fresh = Persistence.Default()
 
-	-- 2) Сохранить «чистый» сейв в DS/мок (перезаписываем старый прогресс)
+	-- 2) Сохранить «чистый» сейв в DS
 	Persistence.Save(player, fresh)
+	Persistence.FlushNow(player) -- ВАЖНО: сразу сохраняем
 
 	-- 3) Удалить подсказки посадки, участок и освободить якорь, очистить сервисы
 	clearPlantPrompts(player)
@@ -457,7 +461,12 @@ end)
 -- Жизненный цикл игрока
 Players.PlayerAdded:Connect(function(player)
 	local save = Persistence.Load(player)
-	if not save then save = Persistence.Default() end
+	if not save then 
+		save = Persistence.Default()
+		-- Для новых игроков сохраняем дефолтный сейв
+		Persistence.Save(player, save)
+		Persistence.FlushNow(player)
+	end
 
 	-- Валюта/Инвентарь
 	CurrencyService.Init(player, save.Currency)
@@ -483,6 +492,7 @@ end)
 Players.PlayerRemoving:Connect(function(player)
 	local plot = getPlot(player)
 	if plot then
+		-- Собираем актуальное состояние участка
 		local partial = PlantRuntime.CollectState(plot)
 		local save = Persistence.Load(player) or Persistence.Default()
 		save.UnlockedTier = partial.UnlockedTier or save.UnlockedTier
@@ -490,12 +500,21 @@ Players.PlayerRemoving:Connect(function(player)
 		save.DayCount = partial.DayCount or save.DayCount
 		save.Currency = CurrencyService.Export(player)
 		save.Inventory = InventoryService.Export(player)
+
+		-- ВАЖНО: сохраняем при выходе
 		Persistence.Save(player, save)
+		Persistence.FlushNow(player)
 	end
+
 	cleanup(player)
-	resetCooldown[player] = nil -- Очистка cooldown
+	resetCooldown[player] = nil
+
+	-- Очистка сервисов
+	CurrencyService.Cleanup(player)
+	InventoryService.Cleanup(player)
 end)
 
+-- ВАЖНО: Сохранение при закрытии сервера
 game:BindToClose(function()
 	for player, plot in pairs(PlayerToPlot) do
 		local partial = PlantRuntime.CollectState(plot)
@@ -505,6 +524,9 @@ game:BindToClose(function()
 		save.DayCount = partial.DayCount or save.DayCount
 		save.Currency = CurrencyService.Export(player)
 		save.Inventory = InventoryService.Export(player)
-		Persistence.Save(player, save)
+		Persistence.FlushNow(player)
 	end
+
+	-- Ждем завершения всех сохранений
+	task.wait(2)
 end)

@@ -1,9 +1,9 @@
--- LocalScript: HUD (валюта снизу слева), модалка магазина по центру,
--- использование стандартного Backpack. Привязка к экипировке Tool.
-
+-- Hud.lua
+-- LocalScript: HUD (валюта снизу слева), индикатор оружия, модалка магазина по центру
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 local CurrencyChanged = Remotes:WaitForChild("CurrencyChanged")
@@ -14,6 +14,8 @@ local RequestBuySeed = Remotes:WaitForChild("RequestBuySeed")
 local SeedToolEquipped = Remotes:WaitForChild("SeedToolEquipped")
 local SeedToolUnequipped = Remotes:WaitForChild("SeedToolUnequipped")
 
+-- Remote для оружия (ждем с таймаутом, так как может создаваться MeleeService)
+local WeaponEquipped = Remotes:FindFirstChild("WeaponEquipped") or Remotes:WaitForChild("WeaponEquipped", 5)
 
 local GlobalClock = require(ReplicatedStorage.Shared.GlobalClock)
 
@@ -38,12 +40,29 @@ local hudFrame = hud:FindFirstChild("HudFrame") or mk(hud, "Frame", {
 	Size=UDim2.fromOffset(240, 60), BackgroundTransparency=0.4
 })
 
--- Индикатор экипированного оружия (добавить после создания hudFrame)
+-- Валюта
+local leafIcon = hudFrame:FindFirstChild("LeafIcon") or mk(hudFrame, "TextLabel", {
+	Name="LeafIcon", Size=UDim2.fromOffset(44,44), Position=UDim2.new(0,8,0,8),
+	Text="🍃", TextScaled=true, BackgroundTransparency=1
+})
+
+local leafCount = hudFrame:FindFirstChild("LeafCount") or mk(hudFrame, "TextLabel", {
+	Name="LeafCount", Size=UDim2.fromOffset(100, 44), Position=UDim2.new(0, 60, 0, 8),
+	TextScaled=true, Text="0", BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left
+})
+
+-- Отладочная подпись (Unlocked Tier)
+local tierDebug = hudFrame:FindFirstChild("TierDebug") or mk(hudFrame, "TextLabel", {
+	Name="TierDebug", Size=UDim2.fromOffset(72, 44), Position=UDim2.new(0, 160, 0, 8),
+	TextScaled=true, Text="T:1", BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left
+})
+
+-- ===== Индикатор экипированного оружия (bottom-left под HUD) =====
 local weaponFrame = hud:FindFirstChild("WeaponFrame") or mk(hud, "Frame", {
 	Name="WeaponFrame", 
 	AnchorPoint=Vector2.new(0,1), 
-	Position=UDim2.new(0, 270, 1, -16),
-	Size=UDim2.fromOffset(180, 60), 
+	Position=UDim2.new(0, 16, 1, -86),  -- Под основным HUD
+	Size=UDim2.fromOffset(240, 60), 
 	BackgroundTransparency=0.4
 })
 
@@ -51,14 +70,14 @@ local weaponIcon = weaponFrame:FindFirstChild("WeaponIcon") or mk(weaponFrame, "
 	Name="WeaponIcon", 
 	Size=UDim2.fromOffset(44,44), 
 	Position=UDim2.new(0,8,0,8),
-	Text="🔨", 
+	Text="❌", 
 	TextScaled=true, 
 	BackgroundTransparency=1
 })
 
 local weaponName = weaponFrame:FindFirstChild("WeaponName") or mk(weaponFrame, "TextLabel", {
 	Name="WeaponName", 
-	Size=UDim2.fromOffset(110, 44), 
+	Size=UDim2.fromOffset(180, 44), 
 	Position=UDim2.new(0, 60, 0, 8),
 	TextScaled=true, 
 	Text="Нет оружия", 
@@ -67,21 +86,70 @@ local weaponName = weaponFrame:FindFirstChild("WeaponName") or mk(weaponFrame, "
 })
 
 -- Обновление индикатора оружия при экипировке
-WeaponEquipped.OnClientEvent:Connect(function(weaponType)
-	if weaponType == "GoldenShovel" then
-		weaponIcon.Text = "⚜️"
-		weaponName.Text = "Золотая лопата"
-	elseif weaponType == "IronShovel" then
-		weaponIcon.Text = "⚔️"
-		weaponName.Text = "Железная лопата"
-	else
-		weaponIcon.Text = "🔨"
-		weaponName.Text = "Лопата"
-	end
-end)		
+if WeaponEquipped then
+	WeaponEquipped.OnClientEvent:Connect(function(weaponType)
+		if weaponType == "GoldenShovel" then
+			weaponIcon.Text = "⚜️"
+			weaponName.Text = "Золотая лопата"
+		elseif weaponType == "IronShovel" then
+			weaponIcon.Text = "⚔️"
+			weaponName.Text = "Железная лопата"
+		elseif weaponType == "BasicShovel" then
+			weaponIcon.Text = "🔨"
+			weaponName.Text = "Лопата"
+		else
+			weaponIcon.Text = "❌"
+			weaponName.Text = "Нет оружия"
+		end
+	end)
+end
 
--- DEV: кнопка сброса (видна только в Studio; убери позже)
-local RunService = game:GetService("RunService")
+-- Отслеживание Tool в руках для правильного отображения
+local function updateWeaponDisplay()
+	local character = player.Character
+	if not character then 
+		weaponIcon.Text = "❌"
+		weaponName.Text = "Нет оружия"
+		return 
+	end
+
+	local tool = character:FindFirstChildOfClass("Tool")
+	if tool then
+		local weaponType = tool:GetAttribute("WeaponType")
+		if weaponType == "GoldenShovel" then
+			weaponIcon.Text = "⚜️"
+			weaponName.Text = "Золотая лопата"
+		elseif weaponType == "IronShovel" then
+			weaponIcon.Text = "⚔️"
+			weaponName.Text = "Железная лопата"
+		elseif weaponType == "BasicShovel" then
+			weaponIcon.Text = "🔨"
+			weaponName.Text = "Лопата"
+		else
+			weaponIcon.Text = "❌"
+			weaponName.Text = "Нет оружия"
+		end
+	else
+		weaponIcon.Text = "❌"
+		weaponName.Text = "Нет оружия"
+	end
+end
+
+-- Обновляем при изменениях
+player.CharacterAdded:Connect(function(character)
+	character.ChildAdded:Connect(updateWeaponDisplay)
+	character.ChildRemoved:Connect(updateWeaponDisplay)
+	task.wait(0.5)
+	updateWeaponDisplay()
+end)
+
+if player.Character then
+	player.Character.ChildAdded:Connect(updateWeaponDisplay)
+	player.Character.ChildRemoved:Connect(updateWeaponDisplay)
+	updateWeaponDisplay()
+end
+
+-- ===== DEV: кнопка сброса (видна только в Studio) =====
 local RequestFullReset = Remotes:WaitForChild("RequestFullReset")
 
 local devReset = hud:FindFirstChild("DevResetBtn") or (function()
@@ -89,7 +157,7 @@ local devReset = hud:FindFirstChild("DevResetBtn") or (function()
 	b.Name = "DevResetBtn"
 	b.Size = UDim2.fromOffset(140, 36)
 	b.AnchorPoint = Vector2.new(0,1)
-	b.Position = UDim2.new(0, 16, 1, -86) -- под HUD
+	b.Position = UDim2.new(0, 16, 1, -156) -- еще ниже под оружием
 	b.TextScaled = true
 	b.Text = "DEV: Reset"
 	b.BackgroundTransparency = 0.2
@@ -101,18 +169,6 @@ devReset.Visible = RunService:IsStudio()  -- в игре скрыто
 devReset.MouseButton1Click:Connect(function()
 	RequestFullReset:FireServer()
 end)
-
-
---Валюта
-local leafIcon = hudFrame:FindFirstChild("LeafIcon") or mk(hudFrame, "TextLabel", {
-	Name="LeafIcon", Size=UDim2.fromOffset(44,44), Position=UDim2.new(0,8,0,8),
-	Text="🍃", TextScaled=true, BackgroundTransparency=1
-})
-
-local leafCount = hudFrame:FindFirstChild("LeafCount") or mk(hudFrame, "TextLabel", {
-	Name="LeafCount", Size=UDim2.fromOffset(100, 44), Position=UDim2.new(0, 60, 0, 8),
-	TextScaled=true, Text="0", BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left
-})
 
 -- ==== Индикатор фазы (по центру сверху) ====
 local DayNightChanged = Remotes:WaitForChild("DayNightChanged")
@@ -138,14 +194,15 @@ local function fmt(sec)
 	return string.format("%02d:%02d", m, s)
 end
 
+-- Инициализация фазы
+local currentPhase = "day"
+local timeLeft = 0
+
 local ph, left = GlobalClock.nowPhase()
 currentPhase = ph
 timeLeft = left
 phaseIcon.Text = (ph == "night") and "🌙" or "☀"
 phaseText.Text = ((ph == "night") and "Night " or "Day ") .. fmt(left)
-
-local currentPhase = "day"
-local timeLeft = 0
 
 DayNightChanged.OnClientEvent:Connect(function(phase, duration)
 	currentPhase = phase
@@ -160,8 +217,6 @@ DayTimer.OnClientEvent:Connect(function(phase, t)
 	phaseIcon.Text = (currentPhase == "night") and "🌙" or "☀"
 	phaseText.Text = ((currentPhase == "night") and "Night " or "Day ") .. fmt(timeLeft)
 end)
-
-
 
 -- ==== Boss Event Indicator (top-right) ====
 local BossEventChanged = Remotes:WaitForChild("BossEventChanged")
@@ -218,28 +273,19 @@ BossEventChanged.OnClientEvent:Connect(function(active)
 	end
 end)
 
-
-
-
--- отладочная подпись (Unlocked Tier)
-local tierDebug = hudFrame:FindFirstChild("TierDebug") or mk(hudFrame, "TextLabel", {
-	Name="TierDebug", Size=UDim2.fromOffset(72, 44), Position=UDim2.new(0, 160, 0, 8),
-	TextScaled=true, Text="T:1", BackgroundTransparency=1, TextXAlignment=Enum.TextXAlignment.Left
-})
-
--- ===== Модалка магазина =====
+-- ===== Модалка магазина (семена + оружие) =====
 local shopGui = playerGui:FindFirstChild("SeedShopUI") or mk(playerGui, "ScreenGui", {
 	Name="SeedShopUI", ResetOnSpawn=false, Enabled=false
 })
 
 local modal = shopGui:FindFirstChild("Modal") or mk(shopGui, "Frame", {
 	Name="Modal", AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5),
-	Size=UDim2.fromOffset(420, 260), BackgroundTransparency=0.2
+	Size=UDim2.fromOffset(500, 400), BackgroundTransparency=0.2
 })
 
 local title = modal:FindFirstChild("Title") or mk(modal, "TextLabel", {
-	Name="Title", Size=UDim2.fromOffset(380, 32), Position=UDim2.new(0,20,0,16),
-	TextScaled=true, BackgroundTransparency=1, Text="Магазин семян"
+	Name="Title", Size=UDim2.fromOffset(460, 32), Position=UDim2.new(0,20,0,16),
+	TextScaled=true, BackgroundTransparency=1, Text="Магазин"
 })
 
 local closeBtn = modal:FindFirstChild("CloseBtn") or mk(modal, "TextButton", {
@@ -247,24 +293,60 @@ local closeBtn = modal:FindFirstChild("CloseBtn") or mk(modal, "TextButton", {
 	TextScaled=true, Text="✖"
 })
 
-local grid = modal:FindFirstChild("Grid") or mk(modal, "Frame", {
-	Name="Grid", Size=UDim2.fromOffset(380, 180), Position=UDim2.new(0,20,0,60), BackgroundTransparency=1
+-- Раздел семян
+local seedsLabel = modal:FindFirstChild("SeedsLabel") or mk(modal, "TextLabel", {
+	Name="SeedsLabel", Size=UDim2.fromOffset(200, 24), Position=UDim2.new(0,20,0,60),
+	TextScaled=true, BackgroundTransparency=1, Text="🌱 СЕМЕНА:", TextXAlignment=Enum.TextXAlignment.Left
 })
 
-local function mkBuy(name, price, x, y, id)
-	local btn = grid:FindFirstChild(name) or mk(grid, "TextButton", {
-		Name=name, Size=UDim2.fromOffset(180, 48), Position=UDim2.new(0, x, 0, y),
-		TextScaled=true, Text = ("%s (%d)"):format(name, price)
+local seedGrid = modal:FindFirstChild("SeedGrid") or mk(modal, "Frame", {
+	Name="SeedGrid", Size=UDim2.fromOffset(460, 120), Position=UDim2.new(0,20,0,90), BackgroundTransparency=1
+})
+
+local function mkBuySeed(name, price, x, y, id)
+	local btn = seedGrid:FindFirstChild(name) or mk(seedGrid, "TextButton", {
+		Name=name, Size=UDim2.fromOffset(220, 48), Position=UDim2.new(0, x, 0, y),
+		TextScaled=true, Text = ("%s (%d 🍃)"):format(name, price)
 	})
 	btn.MouseButton1Click:Connect(function()
 		RequestBuySeed:FireServer(id, 1)
 	end)
 end
 
-mkBuy("Горох",     SEED_PRICES.pea,       0,   0,   "pea")
-mkBuy("Подсолнух", SEED_PRICES.sunflower, 200, 0,   "sunflower")
-mkBuy("Орех",      SEED_PRICES.wallnut,   0,   60,  "wallnut")
-mkBuy("Груша",     SEED_PRICES.pear,      200, 60,  "pear")
+mkBuySeed("Горох",     SEED_PRICES.pea,       0,   0,   "pea")
+mkBuySeed("Подсолнух", SEED_PRICES.sunflower, 240, 0,   "sunflower")
+mkBuySeed("Орех",      SEED_PRICES.wallnut,   0,   60,  "wallnut")
+mkBuySeed("Груша",     SEED_PRICES.pear,      240, 60,  "pear")
+
+-- Раздел оружия
+local weaponsLabel = modal:FindFirstChild("WeaponsLabel") or mk(modal, "TextLabel", {
+	Name="WeaponsLabel", Size=UDim2.fromOffset(200, 24), Position=UDim2.new(0,20,0,230),
+	TextScaled=true, BackgroundTransparency=1, Text="⚔️ ОРУЖИЕ:", TextXAlignment=Enum.TextXAlignment.Left
+})
+
+local weaponGrid = modal:FindFirstChild("WeaponGrid") or mk(modal, "Frame", {
+	Name="WeaponGrid", Size=UDim2.fromOffset(460, 120), Position=UDim2.new(0,20,0,260), BackgroundTransparency=1
+})
+
+-- Remote для покупки оружия
+local RequestBuyWeapon = Remotes:FindFirstChild("RequestBuyWeapon") or Remotes:WaitForChild("RequestBuyWeapon", 5)
+
+local function mkBuyWeapon(name, price, icon, x, y, weaponType)
+	local btn = weaponGrid:FindFirstChild(name) or mk(weaponGrid, "TextButton", {
+		Name=name, Size=UDim2.fromOffset(220, 48), Position=UDim2.new(0, x, 0, y),
+		TextScaled=true, Text = ("%s %s (%d 🍃)"):format(icon, name, price),
+		BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+	})
+
+	if RequestBuyWeapon then
+		btn.MouseButton1Click:Connect(function()
+			RequestBuyWeapon:FireServer(weaponType)
+		end)
+	end
+end
+
+mkBuyWeapon("Железная лопата", 500,  "⚔️", 0,   0, "IronShovel")
+mkBuyWeapon("Золотая лопата",  2000, "⚜️", 240, 0, "GoldenShovel")
 
 closeBtn.MouseButton1Click:Connect(function() shopGui.Enabled = false end)
 OpenSeedShop.OnClientEvent:Connect(function() shopGui.Enabled = true end)
@@ -321,28 +403,26 @@ local function bindAll()
 	end)
 end
 
-
-
 bindAll()
 
--- DEV DAMAGE (Studio only): V стреляет из центра экрана
-local RunService = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Remotes = ReplicatedStorage:WaitForChild("Remotes")
-local DevDealDamage = Remotes:WaitForChild("DevDealDamage")
-
+-- ===== DEV DAMAGE (Studio only): V стреляет из центра экрана =====
 if RunService:IsStudio() then
-	local UIS = game:GetService("UserInputService")
-	UIS.InputBegan:Connect(function(input, gpe)
-		if gpe then return end
-		if input.KeyCode == Enum.KeyCode.V then
-			local cam = workspace.CurrentCamera
-			if not cam then return end
-			local vp = cam.ViewportSize
-			-- Луч из центра экрана, работает и в 1-м, и в 3-м лице
-			local ray = cam:ViewportPointToRay(vp.X * 0.5, vp.Y * 0.5)
-			DevDealDamage:FireServer(ray.Origin, ray.Direction * 200)
-		end
-	end)
+	local DevDealDamage = Remotes:FindFirstChild("DevDealDamage")
+	if not DevDealDamage then
+		-- Если нет DevDealDamage, просто пропускаем эту функцию
+		print("[DEV] DevDealDamage remote not found, skipping V key binding")
+	else
+		local UIS = game:GetService("UserInputService")
+		UIS.InputBegan:Connect(function(input, gpe)
+			if gpe then return end
+			if input.KeyCode == Enum.KeyCode.V then
+				local cam = workspace.CurrentCamera
+				if not cam then return end
+				local vp = cam.ViewportSize
+				-- Луч из центра экрана, работает и в 1-м, и в 3-м лице
+				local ray = cam:ViewportPointToRay(vp.X * 0.5, vp.Y * 0.5)
+				DevDealDamage:FireServer(ray.Origin, ray.Direction * 200)
+			end
+		end)
+	end
 end
-	

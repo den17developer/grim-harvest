@@ -5,6 +5,11 @@ local PlantCatalog = require(game.ReplicatedStorage.Shared.PlantCatalog)
 
 local M = {}
 
+local PlantCombatService = nil
+task.defer(function()
+	PlantCombatService = require(script.Parent.PlantCombatService)
+end)
+
 -- внутренний реестр занятых слотов для каждого plot
 local occupied: {[Model]: {[string]: boolean}} = {}
 
@@ -201,6 +206,14 @@ function M.ApplySave(plot: Model, save: table)
 			M.SpawnPlantAtSlotId(plot, slotId, plantSave)
 		end
 	end
+	
+	if PlantCombatService then
+		for _, obj in ipairs(plot:GetChildren()) do
+			if obj:IsA("BasePart") and obj.Name:find("^Plant_") then
+				PlantCombatService.RegisterPlant(obj, plot)
+			end
+		end
+	end
 end
 
 -- ===== Растения: спавн/удаление/возврат =====
@@ -233,6 +246,11 @@ function M.SpawnPlantAtSlotId(plot: Model, slotId: string, plantSave: table)
 
 	p.Parent = plot
 	occupied[plot][slotId] = true
+	
+	if PlantCombatService then
+		PlantCombatService.RegisterPlant(p, plot)
+	end
+	
 end
 
 function M.RemovePlantBySlot(plot: Model, slotId: string)
@@ -240,6 +258,11 @@ function M.RemovePlantBySlot(plot: Model, slotId: string)
 	for _, obj in ipairs(plot:GetChildren()) do
 		if obj:IsA("BasePart") and obj.Name:find("^Plant_") then
 			if obj:GetAttribute("SlotId") == slotId then
+				-- Удаляем из боевой системы
+				if PlantCombatService then
+					PlantCombatService.UnregisterPlant(obj)
+				end
+
 				local weld = obj:FindFirstChild("CarryWeld")
 				if weld and weld:IsA("WeldConstraint") then weld:Destroy() end
 				obj:Destroy()
